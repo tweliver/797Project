@@ -1,0 +1,482 @@
+/*This is the water detection algortihm used for my GEOG 797 project.  It was provided to me by Dr. Zou my mentor.*/
+/*
+DSWE
+=======
+
+Zhenhua Zou
+zhzou@umd.edu
+
+
+Algorithm description:
+----------------------
+This algorithm is the GEE version of DSWE of John W. Jones (jwjones@usgs.gov) and Michael J. Starbuck (mstarbuck@usgs.gov)'s algorithms(
+https://github.com/USGS-EROS/espa-surface-water-extent/blob/master/dswe/algorithm-description.md).
+
+Inputs:
+-------
+Surface reflectance bands of Landsat 5/7/8 L1T products,'LANDSAT/LT05/C01/T1_SR','LANDSAT/LE07/C01/T1_SR','LANDSAT/LC08/C01/T1_SR'
+
+Output:
+-------
+- This script exports the overall probabilities of the five DSWE classes generated using all Landsat 5,7,8 imagery
+- Outputs are exported to your Google Drive folder in geotiff format in 1-by-1 degree file
+- All class probabilities are scaled by 100 and cast to int (0-100).
+
+Bands of the output image:
+--------
+'B'=blue band,
+'G'=green band,
+'R'=red band,
+'NIR'=near infrared band,
+'pDswe0'=Dry land Probability, 
+'pDswe1'=Water, high confidence, Probability,
+'pDswe2'=Water, moderate confidence, Probability,
+'pDswe3'=Partial Wetland, Probability,
+'pDswe4'=Low Confidence Water or Wetland, Probability,
+'GoodObs'= number of good observations
+
+// due to residual cloud and could shadow, fail to be masked out, open surface water (band 2) in some regions may have a probability < 100
+*/
+
+/////////////////// The below section can be modified ////////////////////////////////////////////
+// Coordinates of rectangle output region
+var leftLon  = -121.769; // left longitude bound of export region
+var rightLon = -121.579; // right longitude bound of export region
+var lowerLat =  38.1787; // lower latitude bound of export region
+var upperLat =  38.4726; // upper latitude bound of export region
+var plotTiles = true; // show 1-by-1 degree tiles on map?
+
+// Year and day range of input images
+var startDate = '2017-02-11'; // start time of study period
+var endDate = '2017-03-30'; // end time of study period
+var doy_bounds = ee.List([0, 365]); // select seasonal or monthly (e.g., July) imagery
+
+// Satellite combinations or use a single image, change false to true for that option
+// Landsat 5: 1984 - 2012
+// Landsat 7: 1999 - Present
+// Landsta 8: 2013 - Present
+var L5L7L8 = false; // by default, data from three satellites (L5/7/8) were used
+
+var only_L7L8 = false; // want to use only Landsat 7 and 8 data?
+var only_L8 = false; // want to use only Landsat 8 data?
+
+var singleImage = true;
+
+
+
+
+//before flood
+var singleImageID = 'LANDSAT/LC08/C01/T1_SR/LC08_044033_20170105';
+var l8_beforeFlood = ee.Image('LANDSAT/LC08/C01/T1_SR/LC08_044033_20170105')
+Map.addLayer(l8_beforeFlood,{bands:['B5','B4','B3'],min:0,max:3000}, 'beforeFlood')
+var basename = 'DSWEs_beforeFlood_20170105';
+// before flood
+
+/*
+// in flood
+var singleImageID = 'LANDSAT/LC08/C01/T1_SR/LC08_044033_20170427';
+var l8_inFlood = ee.Image('LANDSAT/LC08/C01/T1_SR/LC08_044033_20170427')
+Map.addLayer(l8_inFlood,{bands:['B5','B4','B3'],min:0,max:3000}, 'inFlood')
+var basename = 'DSWEs_inFlood_20170427'; 
+// in flood
+*/
+
+/*
+// after flood
+var singleImageID = 'LANDSAT/LC08/C01/T1_SR/LC08_044033_20170513';
+var l8_afterFlood = ee.Image('LANDSAT/LC08/C01/T1_SR/LC08_044033_20170513')
+Map.addLayer(l8_afterFlood,{bands:['B5','B4','B3'],min:0,max:3000}, 'afterFlood')
+var basename = 'DSWEs_afterFlood_20170513'; 
+// after flood
+*/
+
+// Folder and name
+var driveFolder = 'dsweCalifornia'; // create this folder name in your google drive
+
+///////////////// The above section can be modified ///////////////////////////////////////////////
+
+// other parameters
+var large_region = ee.Geometry.Rectangle(leftLon-1,lowerLat-1,rightLon+1,upperLat+1) // this is for dem, which is used to simulate terrain shadow
+
+
+//get the DEM datasets /////////////////////////
+if (upperLat > 59.9 || lowerLat < -56 ) {
+    var final_dem = ee.Image('NASA/ASTER_GED/AG100_003').select('elevation')
+  } else {
+    var final_dem = ee.Image('USGS/SRTMGL1_003');
+  }
+
+// get the terrain shadow
+function getTerrainShadow(image){
+  var azimuth = ee.Number(image.get('SOLAR_AZIMUTH_ANGLE'))
+  var zenith = ee.Number(image.get('SOLAR_ZENITH_ANGLE')).add(1)
+  var shadow_original = ee.Terrain.hillShadow(final_dem,azimuth,zenith,100,false)
+  var shadow = shadow_original.focal_min(1,"square","pixels",1,null)
+  var shadow_mask = ee.Image(0)
+      .where(shadow.eq(0),1)
+      .rename('shadow_mask');
+  return image.addBands(shadow_mask)
+}
+
+
+// apply the mask
+function applyMask(image){
+  var cld = image.select('cloud_mask')
+  var shd = image.select('shadow_mask')
+  var combineMask = ee.Image(1).where(cld.eq(0).and(shd.eq(0)),1)
+  return image.updateMask(combineMask)
+}
+
+//spectral indices
+function calc_mndwi(image) {
+  var mndwi = ee.Image(0).expression(
+      '((g - swir1)/(g + swir1)) * 10000',
+      {
+        'g': image.select("G"),
+        'swir1': image.select("SWIR1")
+      });
+      
+  var mndwi0 = mndwi.where(mndwi.gt(32767),32767)
+  var mndwi1 = mndwi0.where(mndwi0.lt(-32768),-32768)
+  return mndwi1.toInt16().rename("MNDWI");
+}
+
+function calc_mbsr(image) {
+  var mbsr = ee.Image(0).expression(
+      '(g + r) - (nir + swir1)',
+      {
+          'g': image.select("G"),
+          'r': image.select("R"),
+          'nir': image.select("NIR"),
+          'swir1': image.select("SWIR1")
+      });
+  
+  var mbsr0 = mbsr.where(mbsr.gt(32767),32767)
+  var mbsr1 = mbsr0.where(mbsr0.lt(-32768),-32768)
+  return mbsr1.toInt16().rename("MBSR");
+}
+
+function calc_ndvi(image) {
+    var ndvi = ee.Image(0).expression(
+        '((nir - r)/(nir + r)) * 10000',
+        {
+            'nir': image.select("NIR"),
+            'r': image.select("R")
+        });
+        
+    var ndvi0 = ndvi.where(ndvi.gt(32767),32767)
+    var ndvi1 = ndvi0.where(ndvi0.lt(-32768),-32768)
+    return ndvi1.toInt16().rename("NDVI");
+}
+
+function calc_awesh(image) {
+    var awesh = ee.Image(0).expression(
+        'blue + A*g - B*(nir+swir1) - C*swir2',
+        {
+          'blue': image.select('B'),
+          'g': image.select('G'),
+          'nir': image.select('NIR'),
+          'swir1': image.select('SWIR1'),
+          'swir2': image.select('SWIR2'),
+          'A': 2.5,
+          'B': 1.5,
+          'C': 0.25
+        });
+        
+    var awesh0 = awesh.where(awesh.gt(32767),32767)
+    var awesh1 = awesh0.where(awesh0.lt(-32768),-32768)
+    return awesh1.toInt16().rename("AWESH");
+}
+
+// wrapper
+function calc_indices(image) {
+    var bands = ee.Image([
+        calc_mndwi(image),
+        calc_mbsr(image),
+        calc_ndvi(image),
+        calc_awesh(image),
+        image.select("B"),
+        image.select("NIR"),
+        image.select("SWIR1"),
+        image.select("SWIR2"),
+        ]);
+    return bands.set('system:time_start', image.get('system:time_start'));
+}
+
+// water detection criteria
+function test1(image) {
+  return image.select("MNDWI").gt(124);
+}
+
+function test2(image) {
+  return image.select("MBSR").gt(0);
+}
+
+function test3(image) {
+  return image.select("AWESH").gt(0);
+}
+
+function test4(image) {
+  var x = image.select("MNDWI").gt(-4400)
+    .add(image.select("SWIR1").lt(900))
+    .add(image.select("NIR").lt(1500))
+    .add(image.select("NDVI").lt(7000));
+  return x.eq(4);
+}
+
+function test5(image) {
+  var x = image.select("MNDWI").gt(-5000)
+    .add(image.select("B").lt(1000))
+    .add(image.select("SWIR1").lt(3000))
+    .add(image.select("SWIR2").lt(1000))
+    .add(image.select("NIR").lt(2500));
+  return x.eq(5);
+}
+
+// combine five different tests into a single number
+function addTests(image) {
+    var x1 = test1(image);
+    var x2 = test2(image).multiply(10);
+    var x3 = test3(image).multiply(100);
+    var x4 = test4(image).multiply(1000);
+    var x5 = test5(image).multiply(10000);
+   
+    var test = x1.add(x2).add(x3).add(x4).add(x5).rename("test")
+      .set('system:time_start', image.get('system:time_start')); 
+    
+    return test;
+}
+
+/////////////// Major function////////////////////////////////////////////////////////////////////
+function calculate_and_output(ulx,lry,lrx,uly,EW,NS,prefix){
+  
+  var region=ee.Geometry.Rectangle(leftLon,lowerLat,rightLon,upperLat); // 1-by-1 degree tile boundary
+  // chose what satellites to use
+  if (L5L7L8){
+    var tm = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    
+    var etm = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+  
+    var lc = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    var landsatAll = ee.ImageCollection(tm.merge(etm).merge(lc).sort('system:time_start'))
+  }
+  
+  else if(only_L7L8) { 
+    var etm = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+  
+    var lc = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    var landsatAll = ee.ImageCollection(etm.merge(lc).sort('system:time_start'))
+    }
+    
+  else if(only_L8) { 
+    var lc = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    .filterBounds(region)
+    .filterDate(startDate,endDate)
+    .filter(ee.Filter.dayOfYear(doy_bounds.get(0), doy_bounds.get(1)))
+    .sort('system:time_start')
+    .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    var landsatAll = ee.ImageCollection(lc.sort('system:time_start'))
+    }
+    
+  else if (singleImage){
+    
+    if (singleImageID[11]== '8'){
+    var landsatAll = ee.ImageCollection(ee.Image(singleImageID))
+    .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    }
+    else if (singleImageID[11]!= '8') {
+    var landsatAll = ee.ImageCollection(ee.Image(singleImageID))
+    .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],['B', 'G', 'R', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa'])
+    }
+    
+    }
+ 
+  // apply the cloud mask
+  var landsat1 = landsatAll.map(function(x) {
+      var qa = x.select('pixel_qa');
+      var cloudShadowBitMask = ee.Number(2).pow(3).int();
+      var snowBitMask = ee.Number(2).pow(4).int();
+      var cloudBitMask = ee.Number(2).pow(5).int();
+      
+      var cloudShadow = qa.bitwiseAnd(cloudShadowBitMask).neq(0);
+      var snow = qa.bitwiseAnd(snowBitMask).neq(0);
+      var cloud = qa.bitwiseAnd(cloudBitMask).neq(0);
+      
+      var mask = ee.Image(0)
+        .where(cloudShadow.eq(1), 1)
+        .where(snow.eq(1),1)
+        .where(cloud.eq(1), 1)
+        .rename('cloud_mask');
+      return x.addBands(mask);
+    });
+    
+  print (landsat1) // prints how many images
+  
+  // simulate the terrain shadow
+  var landsat2 = landsat1.map(getTerrainShadow)
+
+  // apply the masks
+  var landsat3 = landsat2.map(applyMask)
+  var imageout = ee.Image(landsat3.first())
+
+  // calculate spectrum indices
+  var indices = landsat3.map(calc_indices)
+
+  //DSWE TESTS
+  var tests = indices.map(addTests);
+  
+  //////DSWE CLASSES
+  var dswe0 = tests.map(function(image){
+    var y = image.select('test').eq(0)
+      .add(image.select('test').eq(1))
+      .add(image.select('test').eq(10))
+      .add(image.select('test').eq(100))
+      .add(image.select('test').eq(1000));
+    return y.gt(0)
+      .rename("DSWE0")
+      .set('system:time_start', image.get('system:time_start'));
+  });
+  
+  var dswe1 = tests.map(function(image) {
+    var y = image.select('test').eq(1111)
+      .add(image.select('test').eq(10111))
+      .add(image.select('test').eq(11011))
+      .add(image.select('test').eq(11101))
+      .add(image.select('test').eq(11110))
+      .add(image.select('test').eq(11111));
+    return y.gt(0)
+      .rename("DSWE1")
+      .set('system:time_start', image.get('system:time_start'));
+  });
+  
+  var dswe2 = tests.map(function(image) {
+    var y = image.select('test').eq(111)
+      .add(image.select('test').eq(1011))
+      .add(image.select('test').eq(1101))
+      .add(image.select('test').eq(1110))
+      .add(image.select('test').eq(10011))
+      .add(image.select('test').eq(10101))
+      .add(image.select('test').eq(10110))
+      .add(image.select('test').eq(11001))
+      .add(image.select('test').eq(11010))
+      .add(image.select('test').eq(11100))
+    return y.gt(0)
+      .rename("DSWE2")
+      .set('system:time_start', image.get('system:time_start'));
+  });
+  
+  var dswe3 = tests.map(function(image) {
+    var y = image.select('test').eq(11000)
+    return y.eq(1)
+      .rename("DSWE3")
+      .set('system:time_start', image.get('system:time_start'));
+  });
+  
+  var dswe4 = tests.map(function(image) {
+    var y = image.select('test').eq(11)
+      .add(image.select('test').eq(101))
+      .add(image.select('test').eq(110))
+      .add(image.select('test').eq(1001))
+      .add(image.select('test').eq(1010))
+      .add(image.select('test').eq(1100))
+      .add(image.select('test').eq(10000))
+      .add(image.select('test').eq(10001))
+      .add(image.select('test').eq(10010))
+      .add(image.select('test').eq(10100))
+    return y.gt(0)
+      .rename("DSWE4")
+      .set('system:time_start', image.get('system:time_start'));
+  });
+  
+  //class number and probabilities
+  var num0 = dswe0.sum()
+  var num1 = dswe1.sum()
+  var num2 = dswe2.sum()
+  var num3 = dswe3.sum()
+  var num4 = dswe4.sum()
+
+  var GoodObs = num0.add(num1).add(num2).add(num3).add(num4).toInt16();
+  var pdswe0 = num0.divide(GoodObs).multiply(10000).toInt16();
+  var pdswe1 = num1.divide(GoodObs).multiply(10000).toInt16();
+  var pdswe2 = num2.divide(GoodObs).multiply(10000).toInt16();
+  var pdswe3 = num3.divide(GoodObs).multiply(10000).toInt16();
+  var pdswe4 = num4.divide(GoodObs).multiply(10000).toInt16();
+  
+  // export tiles
+  var mtdswe = ee.Image([imageout.select('B'),imageout.select('G'),imageout.select('R'),imageout.select('NIR'),pdswe0, pdswe1, pdswe2, pdswe3, pdswe4, GoodObs])
+    .rename(['B','G','R','NIR','pDswe0', 'pDswe1', 'pDswe2', 'pDswe3', 'pDswe4','GoodObs']);
+  
+  Export.image.toDrive({
+          crs: 'EPSG:4326',
+          image: mtdswe,
+          description: prefix, //taskName
+          folder: driveFolder, //GoogleDrive folder
+          region: region,
+          scale: 30, //scale
+          maxPixels: 1000000000000
+          });
+  }
+
+/////////////////////////////////////////////// Loop /////////////////////////////
+
+// for padding numeric-strings
+  function pad(num, size) {
+      var s = "000000000" + num;
+      return s.substr(s.length-size);
+  }
+  
+  
+for (var j = lowerLat; j < upperLat; j++) {
+  for (var i = leftLon; i < rightLon; i++) {
+    
+    var ulx = i;
+    var uly = j+1;
+    var lrx = i+1;
+    var lry = j;
+    
+    
+
+    if(i < 0) {
+      var EW = 'W';
+    } else {
+      var EW = 'E';
+    }
+    
+    if(j < 0) {
+      var NS = 'S';
+    } else {
+      var NS = 'N';
+    }
+    
+    var prefix = basename;
+    if(plotTiles) { 
+      var bbox = ee.Geometry.Rectangle(leftLon,lowerLat,rightLon,upperLat);
+      Map.addLayer(bbox, {}, prefix); // show the tiles
+    }
+    calculate_and_output(leftLon,lowerLat,rightLon,upperLat,EW,NS,prefix)
+  }
